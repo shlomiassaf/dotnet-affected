@@ -85,7 +85,7 @@ namespace DotnetAffected.Core
                 
                 // Loading using a file path will not work since creating/opening the root project is done directly, no virtual FS there.
                 // We must use a reader so we control where the content comes.
-                // Later, when we attach it to a Project, imports will be loaded via the git file system...
+                // Later, when we attach it to a Project, imports will be loaded via the git file system...e
                 using var reader = new XmlTextReader(fs.GetFileStream(pathToFile, FileMode.Open, FileAccess.Read, FileShare.None));
                 var projectRootElement = ProjectRootElement.Create(reader, projectCollection);
 

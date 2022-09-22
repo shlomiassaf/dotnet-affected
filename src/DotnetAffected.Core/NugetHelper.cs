@@ -1,54 +1,108 @@
 ﻿using DotnetAffected.Abstractions;
+using Microsoft.Build.Construction;
 using Microsoft.Build.Evaluation;
 using System.Collections.Generic;
-using System.IO;
+using System.Diagnostics.CodeAnalysis;
 using System.Linq;
-using System.Xml;
 
 namespace DotnetAffected.Core
 {
     internal static class NugetHelper
     {
-        public static IEnumerable<(string Package, string Version)> ParseDirectoryPackageProps(string? propsFile)
+        internal class PackageRef
         {
-            if (propsFile == null) return Enumerable.Empty<(string, string)>();
+            /// <summary>
+            /// Gets or sets the package name.
+            /// </summary>
+            public string Name { get; private set; }
+            public string Version { get; private set; }
+            public string Condition { get; private set; }
 
-            Stream GenerateStreamFromString(string s)
+            public string UniqueId { get; private set; }
+
+            private PackageRef()
             {
-                var stream = new MemoryStream();
-                var writer = new StreamWriter(stream);
-                writer.Write(s);
-                writer.Flush();
-                stream.Position = 0;
-                return stream;
             }
 
-            using var reader = new XmlTextReader(GenerateStreamFromString(propsFile));
-            var project = new Project(reader);
+            public static PackageRef Create(ProjectItem item, string? versionOverride = null)
+            {
+                var pkg = new PackageRef
+                {
+                    Name = item.EvaluatedInclude,
+                    Version = versionOverride ?? item.Metadata.Single(m => m.Name == "Version").EvaluatedValue,
+                };
+                
+                // we create a unique Id to the combination of all condition expressions from the item up to all relevant parents
+                var conditions = item.Xml.AllParents
+                    .OfType<ProjectItemGroupElement>()
+                    .Where(e => !string.IsNullOrWhiteSpace(e.Condition))
+                    .Select(e => e.Condition);
 
-            return project.ItemsIgnoringCondition
-                .Where(i => i.ItemType == "PackageVersion")
-                .Select(i => (i.EvaluatedInclude,
-                    i.Metadata.SingleOrDefault(m => m.Name == "Version")!.EvaluatedValue));
+                if (!string.IsNullOrWhiteSpace(item.Xml.Condition))
+                    conditions = new[] { item.Xml.Condition }.Concat(conditions);
+
+                pkg.Condition = string.Join(";", conditions);
+
+                pkg.UniqueId = $"{pkg.Name} {string.Join(";", pkg.Condition)}";
+                return pkg;
+            }
+
+            public override bool Equals(object? obj)
+                => obj is PackageRef pkg && UniqueId == pkg.UniqueId && Version == pkg.Version;
+
+            public override int GetHashCode() => (UniqueId, Version).GetHashCode();
+        }
+        
+        public static IEnumerable<PackageRef> ParseDirectoryPackageProps(Project? project)
+        {
+            if (project == null) return Enumerable.Empty<PackageRef>();
+
+            var centralPackageManagement = !project.MatchPropertyFlag("ManagePackageVersionsCentrally", false);
+            var enablePackageVersionOverride = centralPackageManagement && !project.MatchPropertyFlag("EnablePackageVersionOverride", false);
+            var itemType = centralPackageManagement ? "PackageVersion" : "PackageReference";
+
+            // A project contains the combination of multiple project files (e.g. DirectoryPackageProps can Import others)
+            // So we might have multiple identical package versions for the same package/condition combination.
+            // We only allow multiple package versions if the condition is different.
+            // For a duplicate set in a project the last value is always the one resolved so we will use a dictionary to
+            // reflect that logic.
+            var packages = new Dictionary<string, PackageRef>();
+            foreach (var item in project.ItemsIgnoringCondition)
+            {
+                if (item.ItemType == itemType)
+                {
+                    // TODO: Add support for OverrideVersion
+                    if (item.MatchMetadataFlag("IsImplicitlyDefined", true))
+                        continue;
+
+                    var pkg = enablePackageVersionOverride && item.TryGetMetadataValue("VersionOverride", out var versionOverride)
+                        ? PackageRef.Create(item, versionOverride)
+                        : PackageRef.Create(item);
+
+                    packages[pkg.UniqueId] = pkg;
+                }
+            }
+
+            return packages.Values;
         }
 
-        public static IEnumerable<PackageChange> DiffPackageDictionaries(
-            IEnumerable<(string Package, string Version)> fromPackages,
-            IEnumerable<(string Package, string Version)> toPackages)
+        public static bool TryFindDiffPackageDictionaries(IEnumerable<PackageRef> fromPackages,
+                                                          IEnumerable<PackageRef> toPackages,
+                                                          [NotNullWhen(true)] out IEnumerable<PackageChange>? changedPackages)
         {
             var output = new Dictionary<string, PackageChange>();
-            foreach (var (key, currentVersion) in fromPackages)
+            foreach (var pkg in fromPackages)
             {
                 var otherVersions = toPackages
-                    .Where(p => p.Package == key)
+                    .Where(p => p.Name == pkg.Name)
                     .ToList();
 
                 PackageChange change;
-                change = !output.ContainsKey(key) ? new PackageChange(key) : output[key];
+                change = !output.ContainsKey(pkg.Name) ? new PackageChange(pkg.Name) : output[pkg.Name];
 
                 if (otherVersions.Any())
                 {
-                    if (otherVersions.Any(p => p.Version == currentVersion))
+                    if (otherVersions.Any(p => p.Version == pkg.Version))
                     {
                         continue;
                     }
@@ -56,33 +110,32 @@ namespace DotnetAffected.Core
                     // Updated packages
                     foreach (var other in otherVersions)
                     {
-                        change.OldVersions.Add(other.Version);
+                        change.AddOldVersion(other.Version);
                     }
 
-                    change.NewVersions.Add(currentVersion);
-                    output[key] = change;
+                    change.AddNewVersion(pkg.Version);
+                    output[pkg.Name] = change;
                 }
                 else
                 {
                     // New packages
-                    change.NewVersions.Add(currentVersion);
-                    output[key] = change;
+                    change.AddNewVersion(pkg.Version);
+                    output[pkg.Name] = change;
                 }
             }
 
             // Deleted packages
             foreach (var package in toPackages.Except(fromPackages))
             {
-                if (!output.ContainsKey(package.Package))
-                {
-                    output.Add(package.Package, new PackageChange(package.Package));
-                }
+                if (!output.ContainsKey(package.Name))
+                    output.Add(package.Name, new PackageChange(package.Name));
 
-                var change = output[package.Package];
-                change.OldVersions.Add(package.Version);
+                var change = output[package.Name];
+                change.AddOldVersion(package.Version);
             }
 
-            return output.Values;
+            changedPackages = output.Any() ? output.Values : null;
+            return changedPackages != null;
         }
     }
 }
